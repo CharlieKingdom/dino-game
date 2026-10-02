@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>恐龙快跑</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    background: #f7f7f7;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body.dark { background: #1b1b1b; }
+  #wrap {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  #stage {
+    position: relative;
+    width: 100%;
+    max-width: 720px;
+    height: 220px;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+  #hint {
+    margin-top: 18px;
+    font-size: 13px;
+    color: #9a9a9a;
+    text-align: center;
+    line-height: 1.8;
+    letter-spacing: .3px;
+  }
+  body.dark #hint { color: #7d7d7d; }
+  kbd {
+    display: inline-block;
+    padding: 1px 6px;
+    border: 1px solid #ccc;
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 12px;
+    color: #666;
+    background: #fff;
+  }
+  body.dark kbd { border-color: #444; color: #bbb; background: #262626; }
+  #soundBtn {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font-size: 18px;
+    opacity: .55;
+    transition: opacity .15s;
+    z-index: 2;
+  }
+  #soundBtn:hover { opacity: 1; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="stage">
+      <button id="soundBtn" title="音效开关">🔊</button>
+      <canvas id="game"></canvas>
+    </div>
+    <div id="hint">
+      <kbd>空格</kbd> / <kbd>↑</kbd> 跳跃 &nbsp;·&nbsp; <kbd>↓</kbd> 下蹲 &nbsp;·&nbsp; 点击画面也可跳跃<br>
+      傍晚会自动切换到夜间模式
+    </div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const DPR = window.devicePixelRatio || 1;
+
+  // 逻辑画布尺寸（世界坐标）
+  const W = 720;
+  const H = 220;
+  const GROUND_Y = 172;      // 地面线的 y 坐标（恐龙脚底）
+
+  // ---- 自适应 DPR ----
+  function resize() {
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+  }
+  resize();
+
+  // ---- 主题色 ----
+  const theme = {
+    light: { fg: "#535353", bg: "#f7f7f7" },
+    dark:  { fg: "#f7f7f7", bg: "#1b1b1b" },
+    current: "light"
+  };
+  function applyTheme(mode) {
+    theme.current = mode;
+    document.body.classList.toggle("dark", mode === "dark");
+  }
+
+  // ---- 音效（WebAudio 实时合成，无需外部资源）----
+  const sound = {
+    on: true,
+    ctx: null,
+    ensure() {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) this.ctx = new AC();
+      }
+      if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+      return this.ctx;
+    },
+    blip(freq, dur, type, gainVal) {
+      if (!this.on) return;
+      const c = this.ensure();
+      if (!c) return;
+      const osc = c.createOscillator();
+      const g = c.createGain();
+      osc.type = type || "square";
+      osc.frequency.value = freq;
+      g.gain.setValueAtTime(gainVal || 0.06, c.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+      osc.connect(g); g.connect(c.destination);
+      osc.start(); osc.stop(c.currentTime + dur);
+    },
+    jump()  { this.blip(620, 0.09, "square", 0.05); },
+    point() { this.blip(880, 0.08, "square", 0.05);
+              setTimeout(() => this.blip(1180, 0.10, "square", 0.045), 80); },
+    die()   { this.blip(200, 0.28, "sawtooth", 0.07);
+              setTimeout(() => this.blip(120, 0.35, "sawtooth", 0.06), 90); }
+  };
+
+  // ---- 键盘状态 ----
+  const keys = { up: false, down: false };
+
+  // ---- 恐龙 ----
+  const dino = {
+    x: 60,
+    y: 0,                 // 距地面的偏移（负值表示跳起）
+    vy: 0,
+    onGround: true,
+    ducking: false,
+    w: 44, h: 47,
+    duckW: 59, duckH: 26,
+    legTimer: 0,
+    legFrame: 0,
+    dead: false
+  };
+
+  const GRAVITY = 0.75;      // 重力加速度
+  const JUMP_V = -13.5;      // 起跳初速度
+  const SPEED_START = 5.2;   // 初始横移速度
+  const SPEED_MAX = 13;
+  let speed = SPEED_START;
+
+  // ---- 障碍物 ----
+  // 仙人掌（地面）+ 翼龙（空中）
+  const cactusTypes = [
+    { w: 17, h: 35, n: 1 },
+    { w: 17, h: 35, n: 2 },
+    { w: 17, h: 35, n: 3 },
+    { w: 25, h: 50, n: 1 },
+    { w: 25, h: 50, n: 2 }
+  ];
+  let obstacles = [];
+  let obstacleTimer = 0;
+  let nextObstacleGap = 90;
+
+  // ---- 云 ----
+  let clouds = [];
+  let cloudTimer = 0;
+
+  // ---- 地面细节（小石子）----
+  let groundDots = [];
+  function initGroundDots() {
+    groundDots = [];
+    for (let i = 0; i < 40; i++) {
+      groundDots.push({
+        x: Math.random() * W,
+        y: GROUND_Y + 6 + Math.random() * 24,
+        len: 2 + Math.random() * 10
+      });
+    }
+  }
+  initGroundDots();
+
+  // ---- 分数 ----
+  let distance = 0;
+  let score = 0;
+  let highScore = Number(localStorage.getItem("dinoHigh") || 0);
+  let running = false;
+  let gameOver = false;
+  let lastTime = 0;
+  let accTime = 0;      // 用于夜间模式切换
+  let nightCycle = 0;   // 0=白天 1=夜晚
+
+  // ---- 输入 ----
+  function jump() {
+    if (gameOver) { restart(); return; }
+    if (!running) { start(); }
+    if (dino.onGround && !dino.ducking) {
+      dino.vy = JUMP_V;
+      dino.onGround = false;
+      sound.jump();
+    }
+  }
+  function duck(on) {
+    if (gameOver || !running) return;
+    dino.ducking = on;
+    if (on && !dino.onGround) {
+      // 空中下蹲 → 快速下落
+      dino.vy = Math.max(dino.vy, 9);
+    }
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") {
+      e.preventDefault();
+      if (!keys.up) { keys.up = true; jump(); }
+    } else if (e.code === "ArrowDown" || e.code === "KeyS") {
+      e.preventDefault();
+      keys.down = true;
+      duck(true);
+    } else if (e.code === "Enter") {
+      if (gameOver) restart();
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") {
+      keys.up = false;
+    } else if (e.code === "ArrowDown" || e.code === "KeyS") {
+      keys.down = false;
+      duck(false);
+    }
+  });
+  // 触摸 / 点击
+  window.addEventListener("pointerdown", (e) => {
+    if (e.target && e.target.id === "soundBtn") return;
+    jump();
+  });
+
+  document.getElementById("soundBtn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    sound.on = !sound.on;
+    e.target.textContent = sound.on ? "🔊" : "🔇";
+    if (sound.on) sound.ensure();
+  });
+
+  // ---- 尺寸辅助 ----
+  function dinoBox() {
+    if (dino.ducking && dino.onGround) {
+      return { x: dino.x, y: GROUND_Y - dino.duckH + dino.y, w: dino.duckW, h: dino.duckH };
+    }
+    return { x: dino.x + 6, y: GROUND_Y - dino.h + dino.y, w: dino.w - 12, h: dino.h };
+  }
+
+  // ---- 生成障碍 ----
+  function spawnObstacle() {
+    // 有一定概率生成翼龙（分数达到一定值后）
+    const canBird = score > 300 && Math.random() < 0.28;
+    if (canBird) {
+      const heights = [GROUND_Y - 92, GROUND_Y - 62, GROUND_Y - 30];
+      const hy = heights[Math.floor(Math.random() * heights.length)];
+      obstacles.push({
+        type: "bird",
+        x: W + 20,
+        y: hy,
+        w: 42,
+        h: 30,
+        frame: 0,
+        frameTimer: 0,
+        passed: false
+      });
+    } else {
+      const t = cactusTypes[Math.floor(Math.random() * cactusTypes.length)];
+      const w = t.w * t.n + (t.n > 1 ? 6 : 0);
+      obstacles.push({
+        type: "cactus",
+        x: W + 20,
+        y: GROUND_Y - t.h,
+        w: w,
+        h: t.h,
+        unit: t.w,
+        count: t.n,
+        unitH: t.h,
+        passed: false
+      });
+    }
+    // 根据速度动态设定下次生成间隔
+    nextObstacleGap = 60 + Math.random() * 90 + speed * 6;
+  }
+
+  // ---- 重置 / 开始 / 结束 ----
+  function resetGame() {
+    dino.y = 0; dino.vy = 0; dino.onGround = true; dino.ducking = false;
+    dino.dead = false; dino.legFrame = 0; dino.legTimer = 0;
+    obstacles = [];
+    clouds = [];
+    obstacleTimer = 0;
+    cloudTimer = 40;
+    distance = 0;
+    score = 0;
+    speed = SPEED_START;
+    accTime = 0;
+    nightCycle = 0;
+    applyTheme("light");
+    initGroundDots();
+  }
+  function start() {
+    running = true;
+    gameOver = false;
+    lastTime = 0;
+    sound.ensure();
+  }
+  function restart() {
+    resetGame();
+    running = true;
+    gameOver = false;
+    lastTime = 0;
+  }
+  function die() {
+    dino.dead = true;
+    gameOver = true;
+    running = false;
+    sound.die();
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem("dinoHigh", String(highScore));
+    }
+  }
+
+  // ---- 更新逻辑（dt 为以 60fps 为基准的步进系数）----
+  function update(dt) {
+    // dt 以 1.0 表示一帧（约16.7ms），限制单帧最大步进防止卡顿穿模
+    const step = Math.min(dt, 3);
+
+    // 加速
+    if (speed < SPEED_MAX) speed += 0.0008 * step;
+
+    // 恐龙物理
+    if (!dino.onGround) {
+      dino.vy += GRAVITY * step;
+      dino.y += dino.vy * step;
+      if (dino.y >= 0) {
+        dino.y = 0;
+        dino.vy = 0;
+        dino.onGround = true;
+      }
+    }
+    // 奔跑动画
+    if (dino.onGround && !dino.dead) {
+      dino.legTimer += step;
+      if (dino.legTimer > 6) { dino.legTimer = 0; dino.legFrame ^= 1; }
+    }
+
+    // 障碍物移动 & 生成
+    obstacleTimer += step;
+    if (obstacleTimer >= nextObstacleGap) {
+      obstacleTimer = 0;
+      spawnObstacle();
+    }
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const o = obstacles[i];
+      o.x -= speed * step;
+      if (o.type === "bird") {
+        o.frameTimer += step;
+        if (o.frameTimer > 10) { o.frameTimer = 0; o.frame ^= 1; }
+        o.x -= 1.6 * step; // 翼龙稍快
+      }
+      // 计分
+      if (!o.passed && o.x + o.w < dino.x) {
+        o.passed = true;
+        score += Math.floor(10 * speed / SPEED_START) + 1;
+      }
+      if (o.x + o.w < -30) obstacles.splice(i, 1);
+    }
+
+    // 云
+    cloudTimer += step;
+    if (cloudTimer > 120 && clouds.length < 5) {
+      cloudTimer = 0;
+      clouds.push({
+        x: W + 40,
+        y: 30 + Math.random() * 60,
+        s: 0.6 + Math.random() * 0.7
+      });
+    }
+    for (let i = clouds.length - 1; i >= 0; i--) {
+      clouds[i].x -= (speed * 0.35) * step;
+      if (clouds[i].x < -90) clouds.splice(i, 1);
+    }
+
+    // 地面石子
+    for (const d of groundDots) {
+      d.x -= speed * step;
+      if (d.x < -d.len) {
+        d.x = W + Math.random() * 60;
+        d.y = GROUND_Y + 6 + Math.random() * 24;
+        d.len = 2 + Math.random() * 10;
+      }
+    }
+
+    // 距离 / 分数
+    distance += speed * step;
+    // 每移动一定距离加 1 分（类似原版）
+    if (Math.floor(distance / 40) > Math.floor((distance - speed * step) / 40)) {
+      score += 1;
+      sound.point();
+    }
+
+    // 碰撞检测
+    const db = dinoBox();
+    for (const o of obstacles) {
+      // 稍微收缩障碍物碰撞盒，手感更宽容
+      const pad = o.type === "bird" ? 6 : 3;
+      const ob = { x: o.x + pad, y: o.y + pad, w: o.w - pad * 2, h: o.h - pad * 2 };
+      if (db.x < ob.x + ob.w && db.x + db.w > ob.x &&
+          db.y < ob.y + ob.h && db.y + db.h > ob.y) {
+        die();
+        return;
+      }
+    }
+
+    // 昼夜切换：每约 40 秒切换一次
+    accTime += step;
+    if (accTime > 60 * 40) {
+      accTime = 0;
+      nightCycle ^= 1;
+      applyTheme(nightCycle ? "dark" : "light");
+    }
+  }
+
+  // ---- 绘制 ----
+  function px(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+  }
+
+  function drawCloud(c) {
+    const fg = theme[theme.current].fg;
+    ctx.fillStyle = fg;
+    ctx.globalAlpha = 0.85;
+    const u = 8 * c.s;
+    // 用像素块拼一朵云
+    ctx.fillRect(c.x, c.y, u * 4, u);
+    ctx.fillRect(c.x + u, c.y - u, u * 2, u);
+    ctx.fillRect(c.x + u * 2, c.y - u, u * 2, u);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDino() {
+    const fg = theme[theme.current].fg;
+    const baseX = dino.x;
+    const baseY = GROUND_Y + dino.y;
+
+    if (dino.ducking && dino.onGround) {
+      // 下蹲形态
+      const x = baseX;
+      const y = baseY - dino.duckH;
+      px(x, y, 8, 12, fg);          // 头
+      px(x + 8, y + 4, 34, 12, fg); // 身体
+      px(x + 40, y + 2, 12, 8, fg); // 尾巴
+      px(x + 6, y + 14, 6, 8, fg);  // 腿
+      px(x + 30, y + 14, 6, 8, fg);
+      // 眼睛
+      px(x + 4, y + 3, 2, 2, theme[theme.current].bg);
+      return;
+    }
+
+    const x = baseX;
+    const y = baseY - dino.h;
+    // 头部
+    px(x + 20, y, 18, 16, fg);
+    // 嘴/下颚
+    px(x + 34, y + 6, 10, 6, fg);
+    // 眼睛（用背景色挖出）
+    px(x + 30, y + 4, 3, 3, theme[theme.current].bg);
+    // 脖子
+    px(x + 24, y + 14, 12, 10, fg);
+    // 身体
+    px(x + 8, y + 18, 26, 18, fg);
+    // 前肢
+    px(x + 26, y + 22, 8, 6, fg);
+    // 尾巴
+    px(x, y + 18, 12, 8, fg);
+    // 腿（交替动画）
+    if (dino.dead) {
+      px(x + 10, y + 34, 8, 13, fg);
+      px(x + 22, y + 34, 8, 13, fg);
+    } else if (dino.onGround) {
+      if (dino.legFrame === 0) {
+        px(x + 10, y + 34, 8, 13, fg);
+        px(x + 22, y + 34, 8, 7, fg);
+      } else {
+        px(x + 10, y + 34, 8, 7, fg);
+        px(x + 22, y + 34, 8, 13, fg);
+      }
+    } else {
+      // 空中收腿
+      px(x + 10, y + 34, 8, 9, fg);
+      px(x + 22, y + 34, 8, 9, fg);
+    }
+  }
+
+  function drawCactus(o) {
+    const fg = theme[theme.current].fg;
+    for (let i = 0; i < o.count; i++) {
+      const cx = o.x + i * (o.unit + 6);
+      // 主干
+      px(cx + 5, o.y, 7, o.unitH, fg);
+      // 左臂
+      px(cx, o.y + 10, 5, 12, fg);
+      px(cx, o.y + 10, 7, 5, fg);
+      // 右臂
+      px(cx + 12, o.y + 16, 5, 12, fg);
+      px(cx + 10, o.y + 16, 7, 5, fg);
+    }
+  }
+
+  function drawBird(o) {
+    const fg = theme[theme.current].fg;
+    const x = o.x, y = o.y;
+    // 身体
+    px(x + 12, y + 12, 18, 8, fg);
+    // 头 + 喙
+    px(x + 28, y + 8, 10, 8, fg);
+    px(x + 38, y + 10, 8, 4, fg);
+    // 眼睛
+    px(x + 32, y + 10, 2, 2, theme[theme.current].bg);
+    // 翅膀（两帧）
+    if (o.frame === 0) {
+      px(x + 6, y + 2, 22, 8, fg);   // 翅膀向上
+    } else {
+      px(x + 8, y + 20, 22, 8, fg);  // 翅膀向下
+    }
+  }
+
+  function drawGround() {
+    const fg = theme[theme.current].fg;
+    px(0, GROUND_Y, W, 2, fg);
+    for (const d of groundDots) {
+      px(d.x, d.y, d.len, 2, fg);
+    }
+  }
+
+  function drawScore() {
+    const fg = theme[theme.current].fg;
+    ctx.fillStyle = fg;
+    ctx.font = "bold 16px monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "top";
+    // 高分（右侧，灰色小字）
+    if (highScore > 0) {
+      ctx.globalAlpha = 0.45;
+      ctx.fillText("HI " + String(highScore).padStart(5, "0"), W - 120, 16);
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillText(String(score).padStart(5, "0"), W - 16, 16);
+
+    // 游戏结束
+    if (gameOver) {
+      ctx.textAlign = "center";
+      ctx.font = "bold 20px sans-serif";
+      ctx.fillText("G A M E   O V E R", W / 2, 88);
+      ctx.font = "13px sans-serif";
+      ctx.globalAlpha = 0.7;
+      ctx.fillText("按 空格 / 点击画面 重新开始", W / 2, 116);
+      ctx.globalAlpha = 1;
+    } else if (!running) {
+      ctx.textAlign = "center";
+      ctx.font = "13px sans-serif";
+      ctx.globalAlpha = 0.6;
+      ctx.fillText("按 空格 / 点击画面 开始游戏", W / 2, 116);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function render() {
+    const bg = theme[theme.current].bg;
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    for (const c of clouds) drawCloud(c);
+    drawGround();
+    for (const o of obstacles) {
+      if (o.type === "cactus") drawCactus(o);
+      else drawBird(o);
+    }
+    drawDino();
+    drawScore();
+  }
+
+  // ---- 主循环 ----
+  function loop(t) {
+    if (!lastTime) lastTime = t;
+    let delta = (t - lastTime) / (1000 / 60); // 转成 60fps 基准帧数
+    lastTime = t;
+    if (delta > 3) delta = 3;
+
+    if (running) update(delta);
+    else if (gameOver) { /* 静止，等待重开 */ }
+
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  // 初始界面：让恐龙显示在地面
+  resetGame();
+  render();
+  requestAnimationFrame(loop);
+
+  // 页面切到后台时暂停（避免回来时时间跳变穿模）
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      running = false;
+      lastTime = 0;
+      if (!gameOver) {
+        // 显示"点击继续"提示由 !running 分支渲染
+      }
+    }
+  });
+})();
+</script>
+</body>
+</html>
